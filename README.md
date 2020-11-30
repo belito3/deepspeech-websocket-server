@@ -130,6 +130,8 @@ optional arguments:
                         Save .wav files of utterences to given directory
 ```
 
+## Front-end
+- [web_microphone_websocket](https://github.com/mozilla/DeepSpeech-examples/tree/r0.8/web_microphone_websocket)
 ## Contributions
 
 Pull requests welcome.
