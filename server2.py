@@ -1,6 +1,8 @@
 import argparse, logging, os.path
 from time import time
+import threading, collections, queue, os, os.path
 
+import webrtcvad
 from bottle import get, run, template
 from bottle.ext.websocket import GeventWebSocketServer
 from bottle.ext.websocket import websocket
@@ -69,49 +71,94 @@ if ARGS.bw:
 
 @get('/recognize', apply=[websocket])
 def recognize(ws):
-    logger.debug("new websocket")
+    logger.info("new ws connection")
     start_time = None
-    gSem_acquired = False
+    # gSem_acquired = False
 
+    aggressiveness = 3
+    vad = webrtcvad.Vad(aggressiveness)
+
+    RATE_PROCESS = 16000
+    CHANNELS = 1
+    BLOCKS_PER_SECOND = 50
+
+    sample_rate = RATE_PROCESS
+    block_size = int(RATE_PROCESS / float(BLOCKS_PER_SECOND))
+
+    padding_ms = 300
+    block_duration_ms = 1000 * block_size // sample_rate
+    num_padding_blocks = padding_ms // block_duration_ms
+    logger.info("num_padding_blocks: {}".format(num_padding_blocks))
+
+    ring_buffer = collections.deque(maxlen=num_padding_blocks)
+    triggered = False
+    ratio = 0.75
+    num_blocks = 0
     while True:
         data = ws.receive()
+        num_blocks += 1
+        # print("num = ", num_blocks)
         # logger.log(5, "got websocket data: %r", data)
-
         if isinstance(data, bytearray):
+            block = data
             # Receive stream data
             if not start_time:
                 # Start of stream (utterance)
                 start_time = time()
                 stream = model.createStream()
-                assert not gSem_acquired
-                # logger.debug("acquiring lock for deepspeech ...")
-                gSem.acquire(blocking=True)
-                gSem_acquired = True
-                # logger.debug("lock acquired")
-            stream.feedAudioContent(np.frombuffer(data, np.int16))
+                print('')
+                print('[start]', end='')  # recording started
+            is_speech = vad.is_speech(block, sample_rate)
 
-        elif isinstance(data, str) and data == 'EOS':
-            # End of stream (utterance)
-            eos_time = time()
-            text = stream.finishStream()
-            logger.info("recognized: %r", text)
-            logger.info("    time: total=%s post_eos=%s", time() - start_time, time() - eos_time)
-            ws.send(text)
-            # FIXME: handle ConnectionResetError & geventwebsocket.exceptions.WebSocketError
-            # logger.debug("releasing lock ...")
-            gSem.release()
-            gSem_acquired = False
-            # logger.debug("lock released")
-            start_time = None
+            if not triggered:
+                ring_buffer.append((block, is_speech))
+                num_voiced = len([f for f, speech in ring_buffer if speech])
+                if num_voiced > ratio * ring_buffer.maxlen:
+                    triggered = True
+                    for f, s in ring_buffer:
+                        if is_speech:
+                            print('=', end='')  # still recording
+                        else:
+                            print('.', end='')
+                        stream.feedAudioContent(np.frombuffer(f, np.int16))
+                    ring_buffer.clear()
+            else:
+                if is_speech:
+                    print('=', end='')  # still recording
+                else:
+                    print('.', end='')
+                stream.feedAudioContent(np.frombuffer(block, np.int16))
+                ring_buffer.append((block, is_speech))
+                num_unvoiced = len([f for f, speech in ring_buffer if not speech])
+                if num_unvoiced > ratio * ring_buffer.maxlen:
+                    triggered = False
+                    eos_time = time()
+                    print('[end]', end='')
+                    text = stream.finishStream()
+                    logger.info("recognized: %r", text)
+                    logger.info("    timeTotal=%s recogTime=%s", time() - start_time, time() - eos_time)
+                    ws.send(text)
+                    start_time = None
+
+                    ring_buffer.clear()
+
+        # elif isinstance(data, str) and data == 'EOS':
+        #     # End of stream (utterance)
+        #     eos_time = time()
+        #     text = stream.finishStream()
+        #     logger.info("recognized: %r", text)
+        #     logger.info("    time: total=%s post_eos=%s", time() - start_time, time() - eos_time)
+        #     ws.send(text)
+        #     # FIXME: handle ConnectionResetError & geventwebsocket.exceptions.WebSocketError
+        #     # logger.debug("releasing lock ...")
+        #     gSem.release()
+        #     gSem_acquired = False
+        #     # logger.debug("lock released")
+        #     start_time = None
 
         else:
             # Lost connection
-            logger.debug("dead websocket")
-            if gSem_acquired:
-                # logger.debug("releasing lock ...")
-                gSem.release()
-                gSem_acquired = False
-                # logger.debug("lock released")
+            logger.info("dead ws connection")
             break
 
 
